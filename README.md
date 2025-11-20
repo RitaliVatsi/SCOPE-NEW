@@ -87,7 +87,7 @@ The results will be saved and printed after the script finishes.
 The codebase is built upon [3D-Mem](https://github.com/UMass-Embodied-AGI/3D-Mem), [OpenEQA](https://github.com/facebookresearch/open-eqa), [Explore-EQA](https://github.com/Stanford-ILIAD/explore-eqa), and [ConceptGraph](https://github.com/concept-graphs/concept-graphs).
 We thank the authors for their great works.
 
-## Citing 3D-Mem
+## Citing SCOPE
 
 ```tex
 @misc{wang2025expandscopesemanticcognition,
