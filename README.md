@@ -90,13 +90,13 @@ We thank the authors for their great works.
 ## Citing SCOPE
 
 ```tex
-@misc{wang2025expandscopesemanticcognition,
-      title         = {Expand Your SCOPE: Semantic Cognition over Potential-Based Exploration for Embodied Visual Navigation}, 
-      author        = {Ningnan Wang and Weihuang Chen and Liming Chen and Haoxuan Ji and Zhongyu Guo and Xuchong Zhang and Hongbin Sun},
-      year          = {2025},
-      eprint        = {2511.08935},
-      archivePrefix = {arXiv},
-      primaryClass  = {cs.RO},
-      url           = {https://arxiv.org/abs/2511.08935}, 
+@inproceedings{wang2026expand,
+  title={Expand Your SCOPE: Semantic Cognition over Potential-Based Exploration for Embodied Visual Navigation},
+  author={Wang, Ningnan and Chen, Weihuang and Chen, Liming and Ji, Haoxuan and Guo, Zhongyu and Zhang, Xuchong and Sun, Hongbin},
+  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume={40},
+  number={22},
+  pages={18620--18628},
+  year={2026}
 }
 ```
