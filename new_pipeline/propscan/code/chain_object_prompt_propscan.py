@@ -1,5 +1,44 @@
 """
-Chain-of-landmarks object-goal exploration ("mental map" mode).
+Chain-of-landmarks object-goal exploration ("mental map" mode) - PROPSCAN VARIANT.
+
+Builds on top of chain_object_prompt_cooccur.py (reuses PotentialGraphCooccur +
+the co-occurrence-aware get_potential_estimation from ../../co-occurrence-component/code/
+unchanged - that scoring already validated well, see
+../../co-occurrence-component/results/). This variant adds exactly one more change,
+on top of co-occurrence scoring: navigation COMMITMENT instead of re-deciding "which
+frontier is best" from scratch at every ~1m step.
+
+Root cause this targets (found empirically, not hypothesized): in
+../../co-occurrence-component/results/run_refrigerator_picture_dishwasher_00824/,
+the agent's position log showed it walk ~5m in one direction then reverse and walk
+~6m back the other way, while the VLM's stated reasoning ("go toward the kitchen")
+never changed. Root cause traced in src/tsdf_planner.py / chain_object_prompt_cooccur.py:
+whenever cfg.choose_every_step is true, the main loop FORCIBLY clears
+tsdf_planner.max_point/target_point at the start of every single step whenever the
+current target is a Frontier (see the `if cfg.choose_every_step:` block), even if the
+agent hasn't come close to arriving yet. That throws away a chosen direction before
+it's ever actually walked out, forcing a brand-new full VLM re-decision every ~1m -
+which is how a still-valid "go to the kitchen" answer can flip between different
+physical frontiers step to step.
+
+What this variant changes:
+1. cfg.choose_every_step is set to false in eval_chain_prompt_propscan.yaml. This
+   single flag flip means a chosen Frontier target is no longer cleared prematurely -
+   tsdf_planner.agent_step()'s own target_arrived logic (already in the base code,
+   untouched) becomes the thing that decides when to re-query the VLM: only once the
+   agent has actually walked to and arrived at the chosen frontier, not every step.
+2. On arrival at a Frontier (not a Snapshot - Snapshot arrival already had its own
+   "found" logging), this script explicitly checks whether the current landmark's
+   target class is now visible among detected objects, and logs a clear
+   "landmark NOT found in this direction" message if not - the notify-then-try-a-
+   different-direction signal requested. No exclusion list is needed for "try a
+   different direction next": once an area is walked into and observed,
+   tsdf_planner.update_frontier_map() naturally retires that frontier and the growing
+   map produces new ones further out, so the next VLM query is already working from a
+   different, updated frontier pool.
+
+See ../../GAPS.md, Gap 2, for the co-occurrence gap analysis this builds on, and
+../README.md in this folder for the navigation-commitment design writeup.
 
 Instead of a single target word (run_object_goal.py) or a goal image, this script takes
 a free-text navigation instruction that mentions one or more intermediate landmarks
@@ -31,6 +70,22 @@ os.environ["HABITAT_SIM_LOG"] = (
 )
 os.environ["MAGNUM_LOG"] = "quiet"
 
+import sys
+
+# This script lives 3 levels below SCOPE/ (new_pipeline/propscan/code/), unlike
+# chain_object_prompt.py which sits at SCOPE/ directly - so `from src...` below
+# would fail with "No module named 'src'" without adding SCOPE root to sys.path.
+# It also reuses (not duplicates) PotentialGraphCooccur/get_potential_estimation
+# from ../../co-occurrence-component/code/, so that directory needs to be on
+# sys.path too, before anything imports from either.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_NEW_PIPELINE_DIR = os.path.dirname(os.path.dirname(_THIS_DIR))
+_SCOPE_ROOT = os.path.dirname(_NEW_PIPELINE_DIR)
+_COOCCUR_CODE_DIR = os.path.join(_NEW_PIPELINE_DIR, "co-occurrence-component", "code")
+sys.path.insert(0, _SCOPE_ROOT)
+sys.path.insert(0, _COOCCUR_CODE_DIR)
+sys.path.insert(0, _THIS_DIR)
+
 import argparse
 from omegaconf import OmegaConf
 import random
@@ -53,8 +108,12 @@ from src.utils import resize_image, get_pts_angle_goatbench
 from src.query_vlm_goatbench import query_vlm_for_response
 from src.eval_utils_gpt_goatbench import call_openai_api
 from src.logger_goatbench import Logger
-from src.potential_graph import PotentialGraph
-from src.potential_estimation_gpt_goal import get_potential_estimation
+
+# Reused unchanged from ../../co-occurrence-component/code/ (already on sys.path
+# above) - this variant does not modify or duplicate the co-occurrence scoring,
+# it only changes the navigation-commitment logic further down in this file.
+from potential_graph_cooccur import PotentialGraphCooccur as PotentialGraph
+from potential_estimation_cooccur import get_potential_estimation
 
 
 def parse_landmark_chain(chain_prompt):
@@ -212,6 +271,11 @@ def main(cfg, chain_prompt, split=1):
         global_step += 1
 
         active_entry = current_active_entry(mental_map)
+        # Chain context for co-occurrence-aware scoring: landmarks already confirmed
+        # earlier in this run, in the order they were found. Consumed by
+        # potential_estimation_cooccur.format_content() to tell the VLM this frontier
+        # is being scored mid-sequence, not in isolation.
+        chain_context = [e for e in mental_map if e["found"]]
         subtask_metadata = {
             "question_id": subtask_id,
             "question": f"Can you find the {active_entry['name']}?",
@@ -223,6 +287,7 @@ def main(cfg, chain_prompt, split=1):
             "task_type": "object",
             "viewpoints": [],
             "gt_subtask_explore_dist": None,
+            "chain_context": chain_context,
         }
 
         logging.info(f"\n== step: {cnt_step}, global step: {global_step} ==")
@@ -406,6 +471,10 @@ def main(cfg, chain_prompt, split=1):
                 logging.info(f"Subtask id {subtask_id} invalid: set_next_navigation_point failed!")
                 break
 
+        # Capture this BEFORE agent_step, since agent_step itself clears
+        # tsdf_planner.max_point back to None the moment target_arrived becomes True.
+        was_heading_to_frontier = isinstance(tsdf_planner.max_point, Frontier)
+
         return_values = tsdf_planner.agent_step(
             pts=pts,
             angle=angle,
@@ -423,6 +492,33 @@ def main(cfg, chain_prompt, split=1):
         pts, angle, pts_voxel, fig, _, target_arrived = return_values
         logger.log_step(pts_voxel=pts_voxel)
         logging.info(f"Current position: {pts}, {logger.subtask_explore_dist:.3f}")
+
+        # PROPSCAN: explicit found/not-found signal once a committed direction is
+        # actually walked out (not on every partial step - only on real arrival).
+        # With choose_every_step: false (see cfg), the agent no longer abandons a
+        # chosen frontier before reaching it, so this fires once per direction tried,
+        # not once per meter. No exclusion bookkeeping is needed for "try a different
+        # direction next" - tsdf_planner.update_frontier_map() already retires an
+        # explored frontier and surfaces new ones, so the next VLM query naturally
+        # works from an updated pool.
+        if was_heading_to_frontier and target_arrived:
+            landmark_name = active_entry["name"].lower()
+            detected_here = any(
+                landmark_name in obj["class_name"].lower()
+                for obj in scene.objects.values()
+            )
+            if detected_here:
+                logging.info(
+                    f"PROPSCAN: arrived at frontier - '{active_entry['name']}' now "
+                    f"appears among detected objects, will be considered as a "
+                    f"snapshot candidate next."
+                )
+            else:
+                logging.info(
+                    f"PROPSCAN: landmark '{active_entry['name']}' NOT found in this "
+                    f"direction after arriving at the frontier - considering a "
+                    f"different direction next."
+                )
 
         potential_graph.mark_visited(pts, radius=1.5)
         scene.sanity_check(cfg=cfg)

@@ -1,5 +1,18 @@
 """
-Chain-of-landmarks object-goal exploration ("mental map" mode).
+Chain-of-landmarks object-goal exploration ("mental map" mode) - CO-OCCURRENCE VARIANT.
+
+Same as chain_object_prompt.py (identical mental-map/chain machinery), with exactly one
+component swapped: frontier potential scoring. Instead of src.potential_graph.PotentialGraph
++ src.potential_estimation_gpt_goal.get_potential_estimation (context-free per-frontier
+scoring), this uses PotentialGraphCooccur + the co-occurrence-aware get_potential_estimation
+from ../co-occurrence-component/code/, which additionally:
+- tells the VLM which landmarks have already been confirmed earlier in this run
+  (chain context), and
+- asks for a ROOM_PLAUSIBILITY rating - a zero-shot semantic object/room co-occurrence
+  prior (e.g. dishwashers co-occur with kitchens/sinks) that down-weights (not zeroes)
+  implausible-room frontiers before they're ranked as exploration candidates.
+
+See ../../GAPS.md, Gap 2, for the motivating gap analysis and empirical evidence.
 
 Instead of a single target word (run_object_goal.py) or a goal image, this script takes
 a free-text navigation instruction that mentions one or more intermediate landmarks
@@ -31,6 +44,20 @@ os.environ["HABITAT_SIM_LOG"] = (
 )
 os.environ["MAGNUM_LOG"] = "quiet"
 
+import sys
+
+# This script lives 3 levels below SCOPE/ (new_pipeline/co-occurrence-component/code/),
+# unlike chain_object_prompt.py which sits at SCOPE/ directly. Running
+# `python new_pipeline/co-occurrence-component/code/chain_object_prompt_cooccur.py`
+# only puts this file's own directory on sys.path, not SCOPE/ - so `from src...`
+# below would fail with "No module named 'src'" without this. Insert both the
+# SCOPE root (for src/) and this file's own directory (for potential_graph_cooccur /
+# potential_estimation_cooccur below) up front, before anything imports from either.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCOPE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS_DIR)))
+sys.path.insert(0, _SCOPE_ROOT)
+sys.path.insert(0, _THIS_DIR)
+
 import argparse
 from omegaconf import OmegaConf
 import random
@@ -53,8 +80,13 @@ from src.utils import resize_image, get_pts_angle_goatbench
 from src.query_vlm_goatbench import query_vlm_for_response
 from src.eval_utils_gpt_goatbench import call_openai_api
 from src.logger_goatbench import Logger
-from src.potential_graph import PotentialGraph
-from src.potential_estimation_gpt_goal import get_potential_estimation
+
+# Only these two imports differ from chain_object_prompt.py - the co-occurrence-aware
+# scoring component lives alongside this file, not in src/, so the shared pipeline
+# (run_object_goal.py, run_goatbench_evaluation.py) is untouched. (_THIS_DIR was
+# already added to sys.path above.)
+from potential_graph_cooccur import PotentialGraphCooccur as PotentialGraph
+from potential_estimation_cooccur import get_potential_estimation
 
 
 def parse_landmark_chain(chain_prompt):
@@ -212,6 +244,11 @@ def main(cfg, chain_prompt, split=1):
         global_step += 1
 
         active_entry = current_active_entry(mental_map)
+        # Chain context for co-occurrence-aware scoring: landmarks already confirmed
+        # earlier in this run, in the order they were found. Consumed by
+        # potential_estimation_cooccur.format_content() to tell the VLM this frontier
+        # is being scored mid-sequence, not in isolation.
+        chain_context = [e for e in mental_map if e["found"]]
         subtask_metadata = {
             "question_id": subtask_id,
             "question": f"Can you find the {active_entry['name']}?",
@@ -223,6 +260,7 @@ def main(cfg, chain_prompt, split=1):
             "task_type": "object",
             "viewpoints": [],
             "gt_subtask_explore_dist": None,
+            "chain_context": chain_context,
         }
 
         logging.info(f"\n== step: {cnt_step}, global step: {global_step} ==")
